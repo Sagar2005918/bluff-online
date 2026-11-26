@@ -14,7 +14,8 @@ DECK_SET = set(DECK)
 HUMAN_PLAY = 35
 HUMAN_REVIEW = 15
 DISCONNECT = 25
-LOBBY_WAIT = 8
+LOBBY_WAIT = 10
+ROOM_LIFETIME = 25 * 60
 MAX_ROOMS = 100
 STATIC = Path(__file__).parent / 'static'
 
@@ -22,8 +23,10 @@ def rank(c): return c.split('-')[0]
 def now(): return time.monotonic()
 
 class Room:
-    def __init__(self, t):
+    def __init__(self, t, code):
         self.id = secrets.token_hex(6)
+        self.code = code
+        self.expires_at = t + ROOM_LIFETIME
         self.seats = [None]*4
         self.rev = 0; self.event_id = 0; self.events = deque(maxlen=30)
         self.last_human = t
@@ -51,16 +54,14 @@ class Room:
         self.events.append(dict(id=self.event_id, kind=kind, text=message, **data))
         self.rev += 1
 
-    def joinable(self):
-        # Matchmaking happens before the deal starts. Never inherit a stranger's hand.
-        return self.phase == 'lobby' and any(s is None for s in self.seats)
+    def joinable(self, t):
+        return self.phase == 'lobby' and t < self.deadline and t < self.expires_at and any(s is None for s in self.seats)
 
     def add(self, token, t):
         i = self.seats.index(None)
         self.seats[i] = dict(token=token, name=f'Player {i+1}', seen=t)
         self.last_human = t
         self.emit('join', f'{self.name(i)} joined the table.')
-        if all(self.seats): self.start(t)
         return i
 
     def start(self,t):
@@ -143,10 +144,9 @@ class Room:
 
     def drop(self,i,t):
         name=self.name(i); self.seats[i]=None
-        self.emit('leave',f'{name} left. A bot takes over the seat.')
+        self.emit('leave',f'{name} left. '+('Seat available until countdown ends.' if self.phase=='lobby' else 'A bot takes over the seat.'))
         if (self.phase=='play' and self.turn==i) or (self.phase=='review' and self.reviewer==i):
             self.deadline=min(self.deadline,t+1); self.duration=max(.1,self.deadline-t)
-        if self.phase=='lobby' and not any(self.seats): self.deadline=t+LOBBY_WAIT
 
     def tick(self,t):
         for i,s in enumerate(self.seats):
@@ -167,9 +167,9 @@ class Room:
         elif self.phase=='finish': self.finish(t)
 
     def snapshot(self,i,t):
-        return dict(room=self.id,seat=i,rev=self.rev,phase=self.phase,turn=self.turn,reviewer=self.reviewer,
+        return dict(room=self.id,code=self.code,room_remaining=max(0,self.expires_at-t),seat=i,rev=self.rev,phase=self.phase,turn=self.turn,reviewer=self.reviewer,
             rank=RANKS[self.ri],next_rank=RANKS[(self.ri+1)%13],number=self.number,pile=len(self.pile),
-            players=[dict(name=self.name(j),human=bool(self.seats[j]),style='Human' if self.seats[j] else STYLES[j],count=len(self.hands[j])) for j in range(4)],
+            players=[dict(name=self.name(j) if self.seats[j] or self.phase!='lobby' else 'Open seat',human=bool(self.seats[j]),style='Human' if self.seats[j] else 'Waiting' if self.phase=='lobby' else STYLES[j],count=len(self.hands[j])) for j in range(4)],
             hand=sorted(self.hands[i],key=lambda c:(RANKS.index(rank(c)),SUITS.index(c.split('-')[1]),c)),
             claim=self.claim,revealed=self.revealed,result=self.result,winner=self.winner,
             remaining=max(0,self.deadline-t),duration=self.duration,events=list(self.events),
@@ -184,20 +184,37 @@ class Matchmaker:
             for i,s in enumerate(room.seats):
                 if s and secrets.compare_digest(s['token'],token): return room,i
         return None,None
-    def join(self,token,t):
+    def expire(self,t):
+        for code,room in list(self.rooms.items()):
+            if t>=room.expires_at:
+                del self.rooms[code]
+
+    def join(self,token,t,code=None):
+        self.expire(t)
         room,i=self.locate(token)
-        if room: room.seats[i]['seen']=t; return token,room,i
-        room=next((r for r in self.rooms.values() if r.joinable()),None)
+        if room:
+            if code is not None and code != room.code:
+                raise ValueError('Leave your current room before joining another.')
+            room.seats[i]['seen']=t
+            return token,room,i
+        if not isinstance(code,str) or len(code)!=3 or any(c not in '0123456789' for c in code):
+            raise ValueError('Enter exactly three digits (000–999).')
+        room=self.rooms.get(code)
         if room is None:
             if len(self.rooms)>=MAX_ROOMS: raise ValueError('Server is full. Try again shortly.')
-            room=Room(t); self.rooms[room.id]=room
+            room=Room(t,code); self.rooms[code]=room
+        elif not room.joinable(t):
+            seconds=max(0,int(room.expires_at-t+.999))
+            if room.phase=='lobby' and t<room.deadline:
+                raise ValueError('Room is full. Try another code.')
+            raise ValueError(f'Room already in use. Resets in {seconds//60}:{seconds%60:02d}. Try another code.')
         token=secrets.token_urlsafe(32); i=room.add(token,t)
         return token,room,i
     def tick(self,t):
         with self.lock:
-            for key,r in list(self.rooms.items()):
+            self.expire(t)
+            for r in list(self.rooms.values()):
                 r.tick(t)
-                if not any(r.seats) and t-r.last_human>30: del self.rooms[key]
 
 MATCH=Matchmaker()
 def ticker():
@@ -227,11 +244,14 @@ def application(env,start):
         if not isinstance(body,dict): raise ValueError('Invalid request')
         with MATCH.lock:
             t=now()
+            MATCH.expire(t)
             if path=='/api/join':
-                token,room,i=MATCH.join(token,t)
+                if body.get('code') is None and MATCH.locate(token)[0] is None:
+                    return respond('410 Gone',{'error':'Room expired. Enter a room code to start again.'})
+                token,room,i=MATCH.join(token,t,body.get('code'))
                 return respond('200 OK',{'token':token,'state':room.snapshot(i,t)})
             room,i=MATCH.locate(token)
-            if room is None: return respond('410 Gone',{'error':'Seat expired. Join a new game.'})
+            if room is None: return respond('410 Gone',{'error':'Room or seat expired. Enter a room code to start again.'})
             room.seats[i]['seen']=t
             if path=='/api/leave': room.drop(i,t); return respond('200 OK',{'ok':True})
             if path=='/api/action':
