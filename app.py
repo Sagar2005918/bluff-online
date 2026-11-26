@@ -196,6 +196,7 @@ class Matchmaker:
             if code is not None and code != room.code:
                 raise ValueError('Leave your current room before joining another.')
             room.seats[i]['seen']=t
+            room.tick(t)
             return token,room,i
         if not isinstance(code,str) or len(code)!=3 or any(c not in '0123456789' for c in code):
             raise ValueError('Enter exactly three digits (000–999).')
@@ -253,6 +254,10 @@ def application(env,start):
             room,i=MATCH.locate(token)
             if room is None: return respond('410 Gone',{'error':'Room or seat expired. Enter a room code to start again.'})
             room.seats[i]['seen']=t
+            # Advance the authoritative clock on every authenticated request.
+            # This also works if the background ticker is paused or unavailable.
+            # The matchmaker lock prevents two clients advancing the same phase twice.
+            room.tick(t)
             if path=='/api/leave': room.drop(i,t); return respond('200 OK',{'ok':True})
             if path=='/api/action':
                 action=body.get('action')
